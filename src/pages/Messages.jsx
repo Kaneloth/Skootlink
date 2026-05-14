@@ -21,12 +21,15 @@ const addHiddenMsg    = (uid, id)  => { const s = getHiddenMsgs(uid);  s.add(id)
 const addHiddenChat   = (uid, oid) => { const s = getHiddenChats(uid); s.add(oid); localStorage.setItem(HIDDEN_CHATS_KEY(uid), JSON.stringify([...s])); };
 
 // ── Status icon shown on sent messages ───────────────────────────────────────
-function MsgStatus({ status }) {
-  if (status === 'sending') return <Clock     className="w-3 h-3 opacity-60 inline ml-1" />;
-  if (status === 'failed')  return <AlertCircle className="w-3 h-3 text-red-400 inline ml-1" />;
-  if (status === 'sent')    return <Check      className="w-3 h-3 opacity-70 inline ml-1" />;
-  // delivered (real DB message, no temp status)
-  return                           <CheckCheck  className="w-3 h-3 opacity-70 inline ml-1" />;
+// status: 'sending' | 'failed' | undefined (real DB row)
+// read:   boolean — whether the recipient has opened the message
+function MsgStatus({ status, read }) {
+  if (status === 'sending') return <Clock      className="w-3 h-3 opacity-50 inline ml-1" />;
+  if (status === 'failed')  return null; // no tick on failed
+  // Use opacity only — inherits parent color so ticks stay visible inside
+  // primary-colored sent bubbles AND in the muted conversation list preview.
+  if (read)  return <CheckCheck className="w-3 h-3 opacity-90 inline ml-1" />;
+  return            <Check      className="w-3 h-3 opacity-55 inline ml-1" />;
 }
 
 // ── Skeletons ─────────────────────────────────────────────────────────────────
@@ -96,7 +99,6 @@ export default function Messages() {
   const [selectedChat, setSelectedChat]               = useState(null);
   const [messages, setMessages]                       = useState([]);
   const [newMessage, setNewMessage]                   = useState('');
-  const [subject, setSubject]                         = useState('');
   const [loading, setLoading]                         = useState(false);
   const [newChatEmail, setNewChatEmail]               = useState('');
   const [startNewChat, setStartNewChat]               = useState(false);
@@ -111,9 +113,45 @@ export default function Messages() {
   const selectedChatRef = useRef(null);
   const longPressTimer  = useRef(null);
   const messagesEndRef  = useRef(null);
+  // Per-conversation broadcast channel — used for "delete for everyone" because
+  // Supabase postgres_changes DELETE events are not delivered to the recipient
+  // when RLS is enabled with default REPLICA IDENTITY (the row is gone so RLS
+  // cannot be evaluated). A broadcast channel shared by both users in the
+  // conversation is the reliable alternative.
+  const convChannelRef  = useRef(null);
 
   useEffect(() => { userRef.current = user; },         [user]);
   useEffect(() => { selectedChatRef.current = selectedChat; }, [selectedChat]);
+
+  // Subscribe to a shared broadcast channel whenever a chat is open.
+  // Both participants join the same channel (keyed by sorted user IDs) so
+  // broadcasts from either side — e.g. "delete for everyone" — are received
+  // by both without relying on postgres_changes DELETE (which Supabase drops
+  // when RLS + default REPLICA IDENTITY prevents row-level auth on deletes).
+  useEffect(() => {
+    if (convChannelRef.current) {
+      supabase.removeChannel(convChannelRef.current);
+      convChannelRef.current = null;
+    }
+    if (!selectedChat || !user) return;
+
+    const convKey = [user.id, selectedChat.otherUserId].sort().join('_');
+    const ch = supabase
+      .channel(`conv-broadcast-${convKey}`)
+      .on('broadcast', { event: 'message_deleted' }, ({ payload }) => {
+        if (payload?.id) {
+          setMessages((prev) => prev.filter((m) => m.id !== payload.id));
+        }
+        fetchConversations();
+      })
+      .subscribe();
+
+    convChannelRef.current = ch;
+    return () => {
+      supabase.removeChannel(ch);
+      convChannelRef.current = null;
+    };
+  }, [selectedChat, user]);
 
   // Auto-scroll to latest message
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -158,11 +196,13 @@ export default function Messages() {
         const otherId = msg.sender_id === u.id ? msg.receiver_id : msg.sender_id;
         if (!grouped[otherId]) {
           grouped[otherId] = {
-            otherUserId:  otherId,
+            otherUserId:   otherId,
             otherUserName: nameMap[otherId] || 'User',
-            lastMessage:  msg.body,
-            unread:       !msg.read && msg.receiver_id === u.id,
-            lastTime:     msg.created_at,
+            lastMessage:   msg.body,
+            lastSenderId:  msg.sender_id,
+            lastRead:      msg.read,
+            unread:        !msg.read && msg.receiver_id === u.id,
+            lastTime:      msg.created_at,
           };
         }
       });
@@ -193,8 +233,26 @@ export default function Messages() {
         (payload) => handleRealtimeInsert(payload.new))
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `receiver_id=eq.${user.id}` },
         (payload) => handleRealtimeInsert(payload.new))
+      // When the recipient marks a message as read, flip the tick on the sender's side
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `sender_id=eq.${user.id}` },
+        (payload) => {
+          if (payload.new?.id) {
+            setMessages((prev) =>
+              prev.map((m) => m.id === payload.new.id ? { ...m, read: payload.new.read } : m)
+            );
+          }
+          fetchConversations();
+        })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages' },
-        () => fetchConversations())
+        (payload) => {
+          // Remove the deleted message from the open chat on both sides.
+          // payload.old contains at least the primary key even when
+          // REPLICA IDENTITY is not set to FULL.
+          if (payload.old?.id) {
+            setMessages((prev) => prev.filter((m) => m.id !== payload.old.id));
+          }
+          fetchConversations();
+        })
       .subscribe();
 
     return () => supabase.removeChannel(channel);
@@ -276,7 +334,6 @@ export default function Messages() {
 
     const tempId      = `temp-${Date.now()}`;
     const msgBody     = newMessage.trim();
-    const msgSubject  = subject || null;
 
     // Optimistically add message immediately so the user sees it right away
     const optimistic = {
@@ -285,19 +342,17 @@ export default function Messages() {
       _status:     'sending',
       sender_id:   user.id,
       receiver_id: selectedChat.otherUserId,
-      subject:     msgSubject,
       body:        msgBody,
       created_at:  new Date().toISOString(),
       read:        false,
     };
     setMessages((prev) => [...prev, optimistic]);
     setNewMessage('');
-    setSubject('');
 
     setLoading(true);
     const { data: inserted, error } = await supabase
       .from('messages')
-      .insert([{ sender_id: user.id, receiver_id: selectedChat.otherUserId, subject: msgSubject, body: msgBody }])
+      .insert([{ sender_id: user.id, receiver_id: selectedChat.otherUserId, body: msgBody }])
       .select()
       .single();
     setLoading(false);
@@ -316,7 +371,6 @@ export default function Messages() {
   const handleRetry = async (failedMsg) => {
     setMessages((prev) => prev.filter((m) => m.id !== failedMsg.id));
     setNewMessage(failedMsg.body);
-    if (failedMsg.subject) setSubject(failedMsg.subject);
   };
 
   // ── New chat ──────────────────────────────────────────────────────────────
@@ -342,9 +396,18 @@ export default function Messages() {
   const handleDeleteForEveryone = async (msgId) => {
     const { error } = await supabase.from('messages').delete().eq('id', msgId).eq('sender_id', user.id);
     if (error) { toast.error('Could not delete message.'); return; }
+    // Remove from sender's own view immediately
     setMessages((prev) => prev.filter((m) => m.id !== msgId));
     fetchConversations();
     toast.success('Message deleted for everyone.');
+    // Broadcast to the shared conversation channel so the recipient's UI
+    // removes the message instantly (postgres_changes DELETE is unreliable
+    // when Supabase RLS + default REPLICA IDENTITY is in use).
+    convChannelRef.current?.send({
+      type: 'broadcast',
+      event: 'message_deleted',
+      payload: { id: msgId },
+    });
   };
 
   const handleDeleteChat = (otherUserId) => {
@@ -468,7 +531,12 @@ export default function Messages() {
                       </div>
                       <div>
                         <p className="text-sm font-medium text-foreground">{conv.otherUserName}</p>
-                        <p className="text-xs text-muted-foreground truncate max-w-[200px]">{conv.lastMessage}</p>
+                        <p className="text-xs text-muted-foreground truncate max-w-[180px] flex items-center gap-1">
+                          {conv.lastSenderId === user?.id && (
+                            <MsgStatus status={undefined} read={conv.lastRead} />
+                          )}
+                          {conv.lastMessage}
+                        </p>
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
@@ -508,35 +576,39 @@ export default function Messages() {
             </button>
           </div>
 
-          <div className="space-y-3 mb-4 max-h-[60vh] overflow-y-auto" id="messages-container">
+          <div className="space-y-3 mb-4 max-h-[60vh] overflow-y-auto" id="messages-container" style={{ touchAction: 'pan-y' }}>
             {chatLoading ? (
               <MessagesSkeleton />
             ) : (
               visibleMessages.map((msg) => {
-                const isMine  = msg.sender_id === user.id;
+                // Defensive: only true when user.id is known AND matches sender
+                const userId   = user?.id ?? null;
+                const isMine   = userId !== null && msg.sender_id === userId;
                 const isFailed = msg._status === 'failed';
 
                 return (
                   <div
                     key={msg.id}
-                    className={`flex w-full select-none ${isMine ? 'justify-end' : 'justify-start'}`}
+                    className="w-full flex select-none"
                     onContextMenu={(e) => { e.preventDefault(); if (!msg._temp) showMessageMenu(msg); }}
                     onTouchStart={startLongPress(() => { if (!msg._temp) showMessageMenu(msg); })}
                     onTouchEnd={cancelLongPress}
                     onTouchMove={cancelLongPress}
                   >
-                    <div className={`max-w-[75%] p-3 rounded-xl ${
+                    <div className={`max-w-[75%] p-3 rounded-xl ${isMine ? 'ml-auto' : 'mr-auto'} ${
                       isMine
                         ? isFailed
                           ? 'bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700'
-                          : 'bg-primary text-primary-foreground opacity-' + (msg._status === 'sending' ? '60' : '100')
+                          : msg._status === 'sending'
+                            ? 'bg-primary/60 text-primary-foreground'
+                            : 'bg-primary text-primary-foreground'
                         : 'bg-card border border-border/50'
                     }`}>
-                      {msg.subject && <p className="text-xs font-medium mb-1">{msg.subject}</p>}
                       <p className="text-sm">{msg.body}</p>
-                      <div className={`flex items-center justify-end gap-1 mt-1 ${isMine ? 'opacity-70' : 'opacity-50'}`}>
+                      <div className="flex items-center justify-end gap-1 mt-1 opacity-70">
                         <span className="text-[10px]">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                        {isMine && <MsgStatus status={msg._status} />}
+                        {/* Status ticks only on messages I sent */}
+                        {isMine && <MsgStatus status={msg._status} read={msg.read} />}
                       </div>
                       {isFailed && (
                         <button
@@ -556,7 +628,6 @@ export default function Messages() {
 
           {canMessage ? (
             <div className="border-t border-border pt-4">
-              <Input className="mb-2" placeholder="Subject (optional)" value={subject} onChange={(e) => setSubject(e.target.value)} />
               <Textarea
                 placeholder="Type your message…"
                 value={newMessage}
