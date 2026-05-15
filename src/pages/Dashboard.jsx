@@ -243,8 +243,26 @@ export default function Dashboard() {
 
   const getCounterpartyName = (id) => counterpartyNames[id] || '';
 
+  // Track which completed rentals this user has already reviewed so we can hide them
+  const { data: myReviews = [] } = useQuery({
+    queryKey: ['my-reviews'],
+    queryFn: async () => {
+      try {
+        const { data } = await supabase
+          .from('reviews')
+          .select('rental_id')
+          .eq('reviewer_id', user.id);
+        return data || [];
+      } catch { return []; }
+    },
+    enabled: !!user?.id,
+  });
+  const reviewedRentalIds = new Set((myReviews || []).map(r => r.rental_id).filter(Boolean));
+
   const availableForMe = allVehicles.filter(v => v.owner_id !== user?.id);
-  const completedRentals = rentals.filter(r => r.status === 'completed');
+  const completedRentals = rentals
+    .filter(r => r.status === 'completed')
+    .filter(r => !reviewedRentalIds.has(r.id));
 
   const ownerRentals = rentals.filter(r => r.owner_id === user?.id);
   const ownerPendingRentals = ownerRentals.filter(r => r.status === 'pending');
@@ -254,7 +272,11 @@ export default function Dashboard() {
   const driverPendingConfRentals = rentals.filter(r => r.driver_id === user?.id && r.status === 'awaiting_driver_confirmation');
   const driverActiveRentals = rentals.filter(r => r.driver_id === user?.id && r.status === 'active');
 
-  const accountType = user?.subscription_plan || 'driver';
+  // Unsubscribed users see 'both' as a full preview so they can explore
+  // owner AND driver features before choosing a plan.
+  const accountType = user?.subscription_active
+    ? (user?.subscription_plan || 'driver')
+    : 'both';
 
   const scrollToSection = (ref) => {
     ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1073,7 +1095,10 @@ By checking the box and clicking "Accept & Sign Agreement" / "Confirm & Finalize
       {reviewModal && (
         <LeaveReviewModal
           open={!!reviewModal}
-          onClose={() => setReviewModal(null)}
+          onClose={() => {
+            setReviewModal(null);
+            queryClient.invalidateQueries({ queryKey: ['my-reviews'] });
+          }}
           rental={reviewModal.rental}
           currentUser={user}
           targetEmail={reviewModal.targetEmail}
