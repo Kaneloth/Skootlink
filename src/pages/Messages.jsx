@@ -186,23 +186,28 @@ export default function Messages() {
       });
 
       const { data: profiles } = await supabase
-        .from('profiles').select('id, full_name').in('id', Array.from(otherIds));
+        .from('profiles').select('id, full_name, avatar_url, avatar_visible').in('id', Array.from(otherIds));
 
       const nameMap = {};
-      profiles?.forEach((p) => { nameMap[p.id] = p.full_name || 'User'; });
+      const avatarMap = {};
+      profiles?.forEach((p) => {
+        nameMap[p.id]   = p.full_name || 'User';
+        avatarMap[p.id] = p.avatar_visible !== false ? (p.avatar_url || null) : null;
+      });
 
       const grouped = {};
       data.forEach((msg) => {
         const otherId = msg.sender_id === u.id ? msg.receiver_id : msg.sender_id;
         if (!grouped[otherId]) {
           grouped[otherId] = {
-            otherUserId:   otherId,
-            otherUserName: nameMap[otherId] || 'User',
-            lastMessage:   msg.body,
-            lastSenderId:  msg.sender_id,
-            lastRead:      msg.read,
-            unread:        !msg.read && msg.receiver_id === u.id,
-            lastTime:      msg.created_at,
+            otherUserId:    otherId,
+            otherUserName:  nameMap[otherId] || 'User',
+            otherUserAvatar: avatarMap[otherId] || null,
+            lastMessage:    msg.body,
+            lastSenderId:   msg.sender_id,
+            lastRead:       msg.read,
+            unread:         !msg.read && msg.receiver_id === u.id,
+            lastTime:       msg.created_at,
           };
         }
       });
@@ -526,8 +531,12 @@ export default function Messages() {
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
-                        <User className="w-5 h-5 text-primary" />
+                      <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden shrink-0">
+                        {conv.otherUserAvatar ? (
+                          <img src={conv.otherUserAvatar} alt="" className="w-full h-full object-cover" />
+                        ) : (
+                          <User className="w-5 h-5 text-primary" />
+                        )}
                       </div>
                       <div>
                         <p className="text-sm font-medium text-foreground">{conv.otherUserName}</p>
