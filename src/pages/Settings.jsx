@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { auth, supabase } from '@/api/supabaseData';
+import { auth, supabase, saveBiometricRefreshToken } from '@/api/supabaseData';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -241,6 +241,14 @@ export default function Settings() {
 
   const handleLogout = async () => {
     if (localStorage.getItem('scootlink_signin_method') === 'biometric') {
+      // Save the current session tokens WITHOUT calling signOut — signOut (even
+      // scope:'local') sends a server-side revocation that invalidates the refresh
+      // token, breaking biometric restoration. We just navigate away; the Supabase
+      // session stays live in localStorage so Path 1 can refreshSession() on login.
+      try {
+        const { data } = await supabase.auth.getSession(); // no network call if token fresh
+        if (data?.session) saveBiometricRefreshToken(data.session);
+      } catch { /* non-fatal */ }
       navigate('/auth');
     } else {
       await clearTokenCookie();

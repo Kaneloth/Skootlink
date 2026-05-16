@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/api/supabaseClient';
+import { saveBiometricRefreshToken, loadBiometricRefreshToken, clearBiometricRefreshToken } from '@/api/supabaseData';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -53,12 +54,6 @@ async function triggerBiometricLogin() {
       },
     });
   } catch (err) {
-    // NotAllowedError has two causes:
-    //   1. User cancelled the prompt
-    //   2. No matching passkey exists on this domain (e.g. registered on localhost,
-    //      now on skootlink-temp.netlify.app — WebAuthn is domain-bound)
-    // In both cases the credential stored in localStorage is unusable here,
-    // so we treat it the same way: fall back to password.
     if (err.name === 'NotAllowedError' || err.name === 'InvalidStateError') {
       throw biometricError('no-credential', 'no-passkey-on-domain');
     }
@@ -67,28 +62,72 @@ async function triggerBiometricLogin() {
 
   // ── Fingerprint passed — restore the Supabase session ──────────────────────
 
-  const { data: existing } = await supabase.auth.getSession();
-  if (existing?.session) {
-    await setTokenCookie(existing.session.refresh_token);
-    return existing.session;
+  // Path 1: Supabase JS has a live session in memory/localStorage (the normal
+  // case after a biometric logout that did NOT call signOut).
+  try {
+    const { data: r1 } = await supabase.auth.refreshSession();
+    if (r1?.session) {
+      saveBiometricRefreshToken(r1.session);
+      setTokenCookie(r1.session.refresh_token).catch(() => {});
+      return r1.session;
+    }
+  } catch { /* fall through to Path 2 */ }
+
+  // Path 2: Exchange the stored refresh_token via Supabase REST API.
+  // Used when the in-memory session is gone (e.g. page was reloaded after logout).
+  const backup  = loadBiometricRefreshToken();
+  const storedRt = backup?.refresh_token ?? null;
+  if (storedRt) {
+    try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const anonKey    = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      const tokenRes = await fetch(
+        `${supabaseUrl}/auth/v1/token?grant_type=refresh_token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', apikey: anonKey },
+          body: JSON.stringify({ refresh_token: storedRt }),
+        }
+      );
+      if (tokenRes.ok) {
+        const tokens = await tokenRes.json();
+        if (tokens.access_token && tokens.refresh_token) {
+          const { data: s2, error: e2 } = await supabase.auth.setSession({
+            access_token:  tokens.access_token,
+            refresh_token: tokens.refresh_token,
+          });
+          if (!e2 && s2?.session) {
+            saveBiometricRefreshToken(s2.session);
+            setTokenCookie(s2.session.refresh_token).catch(() => {});
+            return s2.session;
+          }
+        }
+      } else {
+        const errTxt = await tokenRes.text().catch(() => '');
+        // Only clear the backup when Supabase confirms the token is dead —
+        // transient errors (network, 5xx) should leave it intact for retry.
+        if (errTxt.includes('refresh_token_not_found')) clearBiometricRefreshToken();
+      }
+    } catch { /* fall through to Path 3 */ }
   }
 
-  const res = await fetch('/.netlify/functions/auth-refresh', {
-    method: 'POST',
-    credentials: 'include',
-  });
+  // Path 3: httpOnly cookie via Netlify function.
+  try {
+    const res = await fetch('/.netlify/functions/auth-refresh', {
+      method: 'POST',
+      credentials: 'include',
+    });
+    if (res.ok) {
+      const { access_token, refresh_token } = await res.json();
+      const { data: s3, error: e3 } = await supabase.auth.setSession({ access_token, refresh_token });
+      if (!e3 && s3?.session) {
+        saveBiometricRefreshToken(s3.session);
+        return s3.session;
+      }
+    }
+  } catch { /* all paths exhausted */ }
 
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    if (body.error === 'no-token') throw biometricError('no-session', 'session-gone');
-    throw biometricError('session-expired', 'session-expired');
-  }
-
-  const { access_token, refresh_token } = await res.json();
-  const { data, error } = await supabase.auth.setSession({ access_token, refresh_token });
-  if (error) throw biometricError('session-expired', 'session-expired');
-
-  return data.session;
+  throw biometricError('session-expired', 'session-expired');
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -128,6 +167,8 @@ export default function Auth() {
       navigate('/');
     } catch (err) {
       if (err.code === 'no-session' || err.code === 'session-expired') {
+        // Temporary diagnostic toast — shows exactly which path failed and why.
+        if (err.detail) toast.error(`Debug: ${err.detail}`, { duration: 15000 });
         setBannerReason('session-expired');
         setLoginStage('password');
       } else if (err.code === 'no-credential') {
@@ -161,6 +202,7 @@ export default function Auth() {
         password: loginPassword,
       });
       if (error) throw error;
+      saveBiometricRefreshToken(data.session);
       if (data.session?.refresh_token) await setTokenCookie(data.session.refresh_token);
       navigate('/');
     } catch (err) {

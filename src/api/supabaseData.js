@@ -165,6 +165,51 @@ export const User        = {
   },
 };
 
+// ─── Biometric session backup ─────────────────────────────────────────────────
+// Stores both tokens so setSession() can restore the session directly.
+// Supabase JS v2 automatically refreshes an expired access_token using the
+// refresh_token inside setSession(), so stale access_tokens are handled safely.
+const BIOMETRIC_SESSION_KEY = 'scootlink_biometric_session';
+
+export function saveBiometricRefreshToken(session) {
+  if (!session?.refresh_token) return;
+  try {
+    localStorage.setItem(BIOMETRIC_SESSION_KEY, JSON.stringify({
+      access_token:  session.access_token  || '',
+      refresh_token: session.refresh_token,
+    }));
+  } catch { /* storage full — non-fatal */ }
+}
+
+export function loadBiometricRefreshToken() {
+  try {
+    const raw = localStorage.getItem(BIOMETRIC_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+export function clearBiometricRefreshToken() {
+  try { localStorage.removeItem(BIOMETRIC_SESSION_KEY); } catch { /* ignore */ }
+}
+
+// Auto-keep the backup in sync with Supabase's own token rotation.
+// Supabase JS v2 rotates refresh tokens on every use. Without this listener,
+// any token saved at login time is stale by the time biometric login runs.
+// This fires on: initial session load, every auto-refresh, and manual sign-in.
+supabase.auth.onAuthStateChange((event, session) => {
+  if (
+    (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') &&
+    session?.refresh_token
+  ) {
+    try {
+      localStorage.setItem(BIOMETRIC_SESSION_KEY, JSON.stringify({
+        access_token:  session.access_token  || '',
+        refresh_token: session.refresh_token,
+      }));
+    } catch { /* full */ }
+  }
+});
+
 // ─── Avatar-aware profile fetcher ────────────────────────────────────────────
 // Uses the Netlify service-role function so avatar_url is resolved from auth
 // user_metadata for users who haven't re-saved their profile since the fix.
