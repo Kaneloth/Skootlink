@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { User, auth } from '@/api/supabaseData';
+import { User, auth, fetchProfilesByIds } from '@/api/supabaseData';
 import { useQuery } from '@tanstack/react-query';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -24,6 +24,9 @@ export default function FindDrivers() {
   const [filters, setFilters] = useState({ location: '', minExperience: 0, minRating: 0, radius: 50 });
   const [currentUser, setCurrentUser] = useState(null);
   const [selectedDriver, setSelectedDriver] = useState(null);
+  // avatarMap: userId → { avatar_url, avatar_visible } from the service-role
+  // Netlify function so photos stored in auth metadata are visible to others.
+  const [avatarMap, setAvatarMap] = useState({});
 
   useEffect(() => {
     auth.me().then(setCurrentUser).catch(() => {});
@@ -33,6 +36,19 @@ export default function FindDrivers() {
     queryKey: ['all-users'],
     queryFn: () => User.list(),
   });
+
+  // Enrich driver list with avatar data via service-role Netlify function.
+  // Runs once after the user list loads.
+  useEffect(() => {
+    if (!users.length) return;
+    fetchProfilesByIds(users.map((u) => u.id))
+      .then((enriched) => {
+        const map = {};
+        enriched.forEach((p) => { map[p.id] = p; });
+        setAvatarMap(map);
+      })
+      .catch(() => {});
+  }, [users]);
 
   const currentYear = new Date().getFullYear();
   const drivers = users.filter(u => {
@@ -139,8 +155,10 @@ export default function FindDrivers() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-primary/10 flex items-center justify-center text-lg font-bold text-primary shrink-0">
-                      {d.full_name?.[0] || '?'}
+                    <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-primary/10 flex items-center justify-center text-lg font-bold text-primary shrink-0 overflow-hidden">
+                      {(() => { const av = avatarMap[d.id]; return av?.avatar_visible !== false && av?.avatar_url
+                        ? <img src={av.avatar_url} alt="" className="w-full h-full object-cover" />
+                        : (d.full_name?.[0] || '?'); })()}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
@@ -174,7 +192,7 @@ export default function FindDrivers() {
       {/* ---------- Driver Detail Modal ---------- */}
       {selectedDriver && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40" onClick={() => setSelectedDriver(null)}>
-          <div 
+          <div
             className="bg-card rounded-2xl shadow-xl w-full max-w-md p-6 border border-border max-h-[85vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
@@ -184,22 +202,20 @@ export default function FindDrivers() {
             </div>
 
             <div className="flex items-center gap-4 mb-4">
-              <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-primary/10 flex items-center justify-center text-2xl font-bold text-primary shrink-0">
-                {selectedDriver.full_name?.[0] || '?'}
+              <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-primary/10 flex items-center justify-center text-2xl font-bold text-primary shrink-0 overflow-hidden">
+                {(() => { const av = avatarMap[selectedDriver.id]; return av?.avatar_visible !== false && av?.avatar_url
+                  ? <img src={av.avatar_url} alt="" className="w-full h-full object-cover" />
+                  : (selectedDriver.full_name?.[0] || '?'); })()}
               </div>
               <div className="min-w-0">
                 <p className="font-semibold text-lg truncate">{selectedDriver.full_name || 'Driver'}</p>
-                <p className="text-sm text-muted-foreground truncate">{selectedDriver.email}</p>
+                {selectedDriver.verified
+                  ? <span className="text-xs text-green-600 font-medium">✅ Verified</span>
+                  : <span className="text-xs text-amber-600 font-medium">⏳ Pending verification</span>}
               </div>
             </div>
 
             <div className="space-y-2 text-sm">
-              {selectedDriver.phone && (
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Phone</span>
-                  <span className="font-medium truncate ml-4">{selectedDriver.phone}</span>
-                </div>
-              )}
               {selectedDriver.location && (
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Location</span>
@@ -212,10 +228,6 @@ export default function FindDrivers() {
                   <span className="font-medium">{currentYear - selectedDriver.license_year} years</span>
                 </div>
               )}
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Verified</span>
-                <span>{selectedDriver.verified ? <Badge className="bg-emerald-100 text-emerald-700">✅ Verified</Badge> : <Badge variant="outline">⏳ Pending</Badge>}</span>
-              </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Rating</span>
                 <span><StarRating value={Math.round(selectedDriver.rating || 0)} size="sm" showValue /></span>
