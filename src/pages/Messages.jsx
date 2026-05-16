@@ -137,6 +137,9 @@ export default function Messages() {
     const handleDeletedEvent = ({ payload }) => {
       if (payload?.id) {
         setMessages((prev) => prev.filter((m) => m.id !== payload.id));
+        // Persist so the message stays hidden after a reload
+        addHiddenMsg(user.id, payload.id);
+        setHiddenMsgs((prev) => new Set([...prev, payload.id]));
       }
       fetchConversations();
     };
@@ -171,6 +174,9 @@ export default function Messages() {
       .on('broadcast', { event: 'message_deleted' }, ({ payload }) => {
         if (payload?.id) {
           setMessages((prev) => prev.filter((m) => m.id !== payload.id));
+          // Persist so the message stays hidden after a reload
+          addHiddenMsg(user.id, payload.id);
+          setHiddenMsgs((prev) => new Set([...prev, payload.id]));
         }
         fetchConversations();
       })
@@ -233,20 +239,30 @@ export default function Messages() {
         });
       } catch { /* non-fatal — conversation list just shows initials */ }
 
+      // Read hidden (deleted-for-everyone) message IDs fresh from localStorage
+      // so that deleted messages are never shown as the conversation preview.
+      const currentHiddenMsgs = getHiddenMsgs(u.id);
+
       const grouped = {};
       data.forEach((msg) => {
         const otherId = msg.sender_id === u.id ? msg.receiver_id : msg.sender_id;
+        // Always record the conversation so it appears in the list, but only
+        // use this message as the preview if it hasn't been deleted.
         if (!grouped[otherId]) {
           grouped[otherId] = {
-            otherUserId:    otherId,
-            otherUserName:  nameMap[otherId] || 'User',
+            otherUserId:     otherId,
+            otherUserName:   nameMap[otherId] || 'User',
             otherUserAvatar: avatarMap[otherId] || null,
-            lastMessage:    msg.body,
-            lastSenderId:   msg.sender_id,
-            lastRead:       msg.read,
-            unread:         !msg.read && msg.receiver_id === u.id,
-            lastTime:       msg.created_at,
+            lastMessage:     null,
+            lastSenderId:    msg.sender_id,
+            lastRead:        msg.read,
+            unread:          !msg.read && msg.receiver_id === u.id,
+            lastTime:        msg.created_at,
           };
+        }
+        // Fill in lastMessage with the first (most-recent) non-hidden message.
+        if (grouped[otherId].lastMessage === null && !currentHiddenMsgs.has(msg.id)) {
+          grouped[otherId].lastMessage = msg.body;
         }
       });
 
@@ -447,8 +463,10 @@ export default function Messages() {
     const { error } = await supabase.from('messages').delete().eq('id', msgId).eq('sender_id', user.id);
     if (error) { toast.error('Could not delete message.'); return; }
 
-    // Remove from sender's own view immediately
+    // Remove from sender's own view immediately and persist across reloads
     setMessages((prev) => prev.filter((m) => m.id !== msgId));
+    addHiddenMsg(user.id, msgId);
+    setHiddenMsgs((prev) => new Set([...prev, msgId]));
     fetchConversations();
     toast.success('Message deleted for everyone.');
 
